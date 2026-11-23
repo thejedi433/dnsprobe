@@ -95,6 +95,30 @@ func answer(t *testing.T, msg []byte, tcp bool) []byte {
 		return nil // silence
 	case "garbage.example":
 		return []byte{1, 2, 3} // short garbage
+	case "badparse.example":
+		// >= 12 bytes so exchangeUDP accepts it, but garbage from the
+		// first label: header says 1 question, name runs off the end.
+		h := make([]byte, 14)
+		binary.BigEndian.PutUint16(h[0:2], id)
+		binary.BigEndian.PutUint16(h[2:4], 0x8180)
+		binary.BigEndian.PutUint16(h[4:6], 1)
+		h[12] = 10 // label claims 10 bytes, 1 exists
+		return h
+	case "truncbad.example":
+		if !tcp {
+			h := make([]byte, 12)
+			binary.BigEndian.PutUint16(h[0:2], id)
+			binary.BigEndian.PutUint16(h[2:4], 0x8380) // TC
+			binary.BigEndian.PutUint16(h[4:6], 1)
+			return append(h, qsec...)
+		}
+		// >= 12 bytes, header says 1 question, truncated name inside
+		h := make([]byte, 14)
+		binary.BigEndian.PutUint16(h[0:2], id)
+		binary.BigEndian.PutUint16(h[2:4], 0x8180)
+		binary.BigEndian.PutUint16(h[4:6], 1)
+		h[12] = 10
+		return h
 	case "trunc.example":
 		if !tcp { // over UDP, claim truncation with just header+question
 			h := make([]byte, 12)
@@ -424,4 +448,136 @@ func TestQueryUsesContextDeadlineClamp(t *testing.T) {
 	if el > 5*time.Second {
 		t.Errorf("ctx deadline ignored: %v", el)
 	}
+}
+
+// UDP answers 12+ bytes that fail Parse (badparse.example) and a
+// truncated-UDP / unparseable-TCP pair (truncbad.example) exercise the
+// post-exchange parse error branches inside Query.
+func TestQueryUDPResponseParseError(t *testing.T) {
+	addr, _ := fakeResolver(t)
+	r := Query(context.Background(), addr, "badparse.example", dns.TypeA, 2*time.Second)
+	if r.Err == "" || r.Answered {
+		t.Fatalf("want parse error, got %+v", r)
+	}
+	if !strings.Contains(r.Err, "malformed") {
+		t.Errorf("err = %q, want malformed mention", r.Err)
+	}
+}
+
+func TestQueryTCPRetryParseError(t *testing.T) {
+	addr, _ := fakeResolver(t)
+	r := Query(context.Background(), addr, "truncbad.example", dns.TypeA, 2*time.Second)
+	if !strings.HasPrefix(r.Err, "tcp retry: ") || !strings.Contains(r.Err, "malformed") {
+		t.Fatalf("want tcp retry parse error, got %+v", r)
+	}
+	if !r.TCPRetry || !r.Truncated {
+		t.Errorf("retry/truncated flags not set: %+v", r)
+	}
+}
+
+func TestExchangeUDPLargeWriteError(t *testing.T) {
+	// A datagram far above the OS socket send limit fails at Write,
+	// covering the write-error branch of exchangeUDP. All three CI
+	// platforms cap UDP datagrams below this size.
+	addr, _ := fakeResolver(t)
+	_, err := exchangeUDP(context.Background(), addr, make([]byte, 4<<20), time.Second)
+	if err == nil {
+		t.Fatal("oversized UDP write accepted")
+	}
+}
+
+func TestExchangeTCPDeadlineClamp(t *testing.T) {
+	// ctx deadline shorter than the explicit timeout must win on the
+	// TCP half too: accept-and-stall server, 150ms ctx vs 30s timeout.
+	lst, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lst.Close()
+	go func() {
+		c, err := lst.Accept()
+		if err != nil {
+			return
+		}
+		time.Sleep(2 * time.Second) // stall past the ctx deadline
+		c.Close()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = exchangeTCP(ctx, lst.Addr().String(), []byte("junk"), 30*time.Second)
+	if err == nil {
+		t.Fatal("stalled TCP exchange returned no error")
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Errorf("TCP deadline clamp ignored: %v", el)
+	}
+}
+
+func TestExchangeTCPReadErrors(t *testing.T) {
+	// (a) server accepts and closes without writing -> lenbuf read fails
+	// (b) server announces 100 bytes then writes only 3 -> body read fails
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closed.Close()
+	go func() {
+		c, err := closed.Accept()
+		if err != nil {
+			return
+		}
+		var lb [2]byte
+		c.Read(lb[:])
+		c.Close() // no response
+	}()
+	if _, err := exchangeTCP(context.Background(), closed.Addr().String(), []byte("junk"), 2*time.Second); err == nil {
+		t.Error("silent TCP close returned no error")
+	}
+
+	short, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer short.Close()
+	go func() {
+		c, err := short.Accept()
+		if err != nil {
+			return
+		}
+		var lb [2]byte
+		c.Read(lb[:])
+		c.Write([]byte{0, 100})  // promises 100 bytes...
+		c.Write([]byte{1, 2, 3}) // ...delivers 3, then EOF on close
+		c.Close()
+	}()
+	if _, err := exchangeTCP(context.Background(), short.Addr().String(), []byte("junk"), 2*time.Second); err == nil {
+		t.Error("short TCP body returned no error")
+	}
+}
+
+func TestExchangeTCPWriteError(t *testing.T) {
+	// The server accepts but never reads: the multi-MB frame fills the
+	// socket buffers, conn.Write blocks until the deadline and fails —
+	// the write-error branch of exchangeTCP, deterministic on all OSes.
+	lst, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lst.Close()
+	stalled := make(chan struct{})
+	go func() {
+		c, err := lst.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		close(stalled)
+		time.Sleep(2 * time.Second) // never read the request
+	}()
+	msg := make([]byte, 8<<20)
+	if _, err := exchangeTCP(context.Background(), lst.Addr().String(), msg, 300*time.Millisecond); err == nil {
+		t.Fatal("write to stalled TCP peer accepted")
+	}
+	<-stalled
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -226,6 +228,73 @@ func TestSystemResolversReal(t *testing.T) {
 	out := systemResolvers()
 	if len(out) == 0 {
 		t.Fatal("no resolvers")
+	}
+}
+
+func TestResolversFromNoNameservers(t *testing.T) {
+	// a resolv.conf with only comments/search: empty result -> fallback
+	dir := t.TempDir()
+	path := filepath.Join(dir, "resolv.conf")
+	if err := os.WriteFile(path, []byte("# nothing here\nsearch example\noptions ndots:5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolversFrom(path)
+	if len(got) != 1 || got[0] != "8.8.8.8" {
+		t.Errorf("fallback = %v, want [8.8.8.8]", got)
+	}
+}
+
+func TestQueryAllProgressErrorBranch(t *testing.T) {
+	// quiet=false with a transport failure hits the ERROR progress line
+	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	addr := pc.LocalAddr().String()
+	pc.Close()
+	results := queryAll(context.Background(), []string{addr}, []string{"x.example"},
+		dns.TypeA, 100*time.Millisecond, 0, 2, false)
+	if len(results) != 1 || results[0].Err == "" {
+		t.Fatalf("want transport error, got %+v", results)
+	}
+}
+
+// failingWriter accepts the first n writes then errors — enough to let
+// bufio buffer small output and fail only at Flush.
+type failingWriter struct{ ok int }
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	if f.ok > 0 {
+		f.ok--
+		return len(p), nil
+	}
+	return 0, errors.New("disk full")
+}
+
+func TestRunFlushError(t *testing.T) {
+	f := newFake(t)
+	// small output sits in bufio; Flush at the end of run() gets the error
+	code, err := run(context.Background(),
+		[]string{"-servers", f.addr, "-q", "ok.example"}, &failingWriter{},
+		func() []string { return nil })
+	if err == nil || code != 2 {
+		t.Errorf("run = (%d, %v), want (2, err)", code, err)
+	}
+}
+
+func TestRunRenderErrorLargeOutput(t *testing.T) {
+	// enough results to spill bufio's 4KB buffer so Table errors
+	// mid-render (err != nil at the flush check and the err check)
+	f := newFake(t)
+	names := make([]string, 0, 120)
+	for i := 0; i < 120; i++ {
+		names = append(names, fmt.Sprintf("ok%d.example", i))
+	}
+	// fakeServer answers only ok.example/nxd.example; unanswered names
+	// time out, but Table renders SERVER/ERROR headers for every result
+	// regardless — buffer spill comes from the 120 header lines.
+	_, err := run(context.Background(),
+		append([]string{"-servers", f.addr, "-timeout", "50ms", "-retries", "0"}, names...),
+		&failingWriter{}, func() []string { return nil })
+	if err == nil {
+		t.Error("expected render/flush error with failing writer and large output")
 	}
 }
 

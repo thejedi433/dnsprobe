@@ -121,6 +121,17 @@ func (f *failWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// failAtWriter fails every write after the first failAfter calls.
+type failAtWriter struct{ ok int }
+
+func (f *failAtWriter) Write(p []byte) (int, error) {
+	if f.ok > 0 {
+		f.ok--
+		return len(p), nil
+	}
+	return 0, errors.New("boom")
+}
+
 func TestTableWriteError(t *testing.T) {
 	results := []probe.Result{
 		rec("a.example", "1.1.1.1:53", "NOERROR", "1.2.3.4", 60),
@@ -128,6 +139,26 @@ func TestTableWriteError(t *testing.T) {
 	}
 	if err := Table(&failWriter{}, results); err == nil {
 		t.Error("write error not propagated")
+	}
+	// header-line failure (first write errors)
+	if err := Table(&failAtWriter{}, results); err == nil {
+		t.Error("header write error not propagated")
+	}
+	// error-note line failure (second write errors, Err set)
+	bad := probe.Result{Server: "9.9.9.9:53", Name: "x.example", Err: "i/o timeout"}
+	if err := Table(&failAtWriter{ok: 1}, []probe.Result{bad}); err == nil {
+		t.Error("error-note write failure not propagated")
+	}
+	// truncated-note line failure (second write errors, Truncated set)
+	tr := rec("a.example", "1.1.1.1:53", "NOERROR", "1.2.3.4", 60)
+	tr.Truncated = true
+	if err := Table(&failAtWriter{ok: 1}, []probe.Result{tr}); err == nil {
+		t.Error("truncated-note write failure not propagated")
+	}
+	// 0-answers note failure (second write errors, no answer rows)
+	empty := probe.Result{Server: "1.1.1.1:53", Name: "a.example", Type: "A", Answered: true, Rcode: "NOERROR"}
+	if err := Table(&failAtWriter{ok: 1}, []probe.Result{empty}); err == nil {
+		t.Error("0-answers write failure not propagated")
 	}
 }
 

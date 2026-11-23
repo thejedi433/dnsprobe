@@ -36,6 +36,13 @@ func TestEncodeNameErrors(t *testing.T) {
 	if _, err := EncodeName(long + ".com"); err == nil {
 		t.Error("over-long label accepted")
 	}
+	// BuildQuery must surface EncodeName errors (covers its error branch)
+	if _, err := BuildQuery(1, "a..b", TypeA); err == nil {
+		t.Error("BuildQuery accepted invalid name")
+	}
+	if _, err := BuildQuery(1, long+".com", TypeA); err == nil {
+		t.Error("BuildQuery accepted over-long name")
+	}
 	// total wire length > 255: pack as many 63-byte labels as fit
 	var parts []string
 	for i := 0; i < 6; i++ {
@@ -332,5 +339,117 @@ func TestReadNameReservedLabel(t *testing.T) {
 	msg = []byte{10, 'a', 'b'}
 	if _, _, err := ReadName(msg, 0); err == nil {
 		t.Error("truncated label accepted")
+	}
+	// name offset past the end of the message
+	msg = []byte{0, 0}
+	if _, _, err := ReadName(msg, 5); err == nil {
+		t.Error("out-of-bounds start accepted")
+	}
+}
+
+func TestReadNameJumpBudget(t *testing.T) {
+	// Deep backward pointer chain: each pointer references the slot
+	// immediately before it, so decoding from the tail walks back
+	// through more hops than the per-name budget (128, RFC 5343 3.3.3).
+	// Every individual pointer is legal; only the chain length is not.
+	n := 140
+	msg := make([]byte, 2+2*n)
+	msg[0] = 0 // chain root: the empty name
+	for i := 1; i <= n; i++ {
+		binary.BigEndian.PutUint16(msg[2*i:], uint16(0xC000|(2*i-2)))
+	}
+	if _, _, err := ReadName(msg, 2*n); err == nil {
+		t.Fatal("deep pointer chain exceeded jump budget undetected")
+	}
+	// a chain of 60 hops must still decode fine
+	msg2 := make([]byte, 2+2*60)
+	msg2[0] = 0
+	for i := 1; i <= 60; i++ {
+		binary.BigEndian.PutUint16(msg2[2*i:], uint16(0xC000|(2*i-2)))
+	}
+	name, _, err := ReadName(msg2, 120)
+	if err != nil {
+		t.Fatalf("shallow chain rejected: %v", err)
+	}
+	if name != "" {
+		t.Errorf("name = %q, want empty (root)", name)
+	}
+}
+
+func TestReadNamePointerToBrokenName(t *testing.T) {
+	// recursion inside a pointer target must propagate the inner error
+	// (target at 0: label claims 10 bytes, only 1 exists)
+	msg := []byte{10, 'a', 0xC0, 0}
+	if _, _, err := ReadName(msg, 2); err == nil {
+		t.Error("pointer to malformed name accepted")
+	}
+}
+
+func TestParseQuestionSectionErrors(t *testing.T) {
+	// QDCOUNT=1, name runs off the message end
+	msg := make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[4:6], 1)
+	msg = append(msg, 10, 'a', 'b')
+	if _, err := Parse(msg); err == nil {
+		t.Error("question name overflow accepted")
+	}
+	// valid question name (root) but qtype/qclass truncated
+	msg = make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[4:6], 1)
+	msg = append(msg, 0, 0xFF, 0xFF)
+	if _, err := Parse(msg); err == nil {
+		t.Error("truncated question trailer accepted")
+	}
+	// valid question, but ANCOUNT points past the end
+	msg = make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[4:6], 1)
+	binary.BigEndian.PutUint16(msg[6:8], 1)
+	msg = append(msg, 0, 0, TypeA, 0, ClassIN)
+	if _, err := Parse(msg); err == nil {
+		t.Error("missing answer section accepted")
+	}
+	// no question, ANCOUNT=1: answer NAME decodes fine (root) but the
+	// 10-byte record header is cut off
+	msg = make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[6:8], 1)
+	msg = append(msg, 0, 1, 2, 3, 4, 5)
+	if _, err := Parse(msg); err == nil {
+		t.Error("truncated record header accepted")
+	}
+	// ANCOUNT=1, answer NAME itself is a broken label
+	msg = make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[6:8], 1)
+	msg = append(msg, 10, 'a')
+	if _, err := Parse(msg); err == nil {
+		t.Error("broken answer name accepted")
+	}
+}
+
+func TestParseRDataErrorBranches(t *testing.T) {
+	cases := []struct {
+		desc string
+		typ  uint16
+		rd   []byte
+	}{
+		{"AAAA wrong length", TypeAAAA, []byte{1, 2, 3, 4}},
+		{"CNAME broken name", TypeCNAMEish, []byte{10, 'a', 'b'}},
+		{"MX too short", TypeMX, []byte{0, 1}},
+		{"MX broken name", TypeMX, []byte{0, 10, 10, 'a', 'b'}},
+		{"SOA broken mname", TypeSOA, []byte{10, 'a', 'b'}},
+		// mname ok, rname length byte says 9 but only 4 bytes left
+		{"SOA broken rname", TypeSOA, []byte{3, 'a', 'b', 'c', 0, 9, 'x', 'y', 'z', 0}},
+		// both names ok but only 10 timer bytes instead of 20
+		{"SOA timers truncated", TypeSOA, []byte{3, 'a', 'b', 'c', 0, 3, 'd', 'e', 'f', 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
+	}
+	for _, c := range cases {
+		msg := buildResponse(t, []struct {
+			name  string
+			typ   uint16
+			ttl   uint32
+			rdata []byte
+		}{{"example.com", c.typ, 60, c.rd}})
+		if _, err := Parse(msg); err == nil {
+			t.Errorf("%s accepted", c.desc)
+		}
 	}
 }
